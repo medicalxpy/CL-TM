@@ -95,8 +95,7 @@ def create_data_loader(adata: anndata.AnnData,
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=SingleCellDataset.collate_fn
+        num_workers=num_workers
     )
     
     return loader

@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import Parameter
 import torch.nn.functional as F
-from bayes import BayesLinear
+from .bayes import BayesLinear
 
 # LAYERS
 class NonLinear(nn.Module):

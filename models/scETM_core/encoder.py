@@ -3,7 +3,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 import torch.nn as nn
-from model_utils.nn import NonLinear
+from ..model_utils.nn import NonLinear
 from typing import List, Union, Sequence
 class EncoderETM(nn.Module):
     """
