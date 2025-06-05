@@ -11,7 +11,7 @@ from models.scETM_core.encoder import EncoderETM
 from models.scETM_core.decoder import DecoderETM
 
 # 导入先验
-from priors.standard_prior import log_Normal_standard, get_kl
+from priors.standard_prior import log_Normal_standard, KL_scETM
 from priors.mixture_prior import VampMixture
 
 # 导入损失计算函数
@@ -38,7 +38,7 @@ class CL_scETM(nn.Module):
         input_batch_id: 是否将批次ID作为输入
         enable_batch_bias: 是否添加批次特定的偏置
         enable_global_bias: 是否添加全局偏置
-        prior_type: 先验类型，'standard'或'mixture'
+        prior_type: 先验类型，'standard'或'vamp'
         n_pseudoinputs: 为混合先验初始化的伪输入数量
         pseudoinputs_mean: 伪输入初始化均值
         pseudoinputs_std: 伪输入初始化标准差
@@ -111,7 +111,7 @@ class CL_scETM(nn.Module):
         )
         
         # 初始化先验
-        if prior_type == 'mixture':
+        if prior_type == 'vamp':
             # 初始化混合先验相关参数
             self.n_pseudoinputs = n_pseudoinputs
             self.pseudoinputs_mean = pseudoinputs_mean
@@ -119,8 +119,6 @@ class CL_scETM(nn.Module):
             
             # 获取示例数据，用于初始化伪输入
             self.X_opt = X_opt
-            
-            # 如果提供了示例数据，使用其平均值初始化第一个伪输入
             if X_opt is not None:
                 mean_opt = X_opt.mean(0, keepdim=True)
                 self.prior = VampMixture(pseudoinputs=[mean_opt], alpha=[1.0])
@@ -213,6 +211,8 @@ class CL_scETM(nn.Module):
                       x: torch.Tensor, 
                       batch_indices: Optional[torch.Tensor] = None,
                       beta: float = 1.0,
+                      pseudoinputs = None,
+                      weights= None,
                       average: bool = True) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         计算模型损失
@@ -231,14 +231,19 @@ class CL_scETM(nn.Module):
         
         # 重构损失（负对数似然）
         nll = -torch.sum(x * fwd_dict['recon_log'], dim=1)
-        
+        prior_params=None
+        if self.prior_type=='vamp':
+            prior_params={
+                'encoder':self.encoder,
+                'pseudoinputs': pseudoinputs,
+                'weights': weights
+            }
         # KL散度
-        if self.prior_type == 'standard':
-            # 标准先验
-            kl = get_kl(fwd_dict['mu_q_delta'], fwd_dict['logsigma_q_delta'])
-        else:
-            # 混合先验
-            kl = self._calculate_mixture_kl(fwd_dict)
+        kl=get_kl_divergence(z=fwd_dict['delta'],
+                             q_mu=fwd_dict['mu_q_delta'],
+                             q_logvar=fwd_dict['logsigma_q_delta'],
+                             prior_type=self.prior_type,
+                            prior_params=prior_params)
         
         # 计算总损失
         loss = nll + beta * kl
@@ -304,90 +309,8 @@ class CL_scETM(nn.Module):
         
         return record
 
-    def _calculate_mixture_kl(self, fwd_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        计算混合先验的KL散度
-        参考自vae/model/boost.py中的log_p_z和calculate_boosting_loss方法
-        
-        参数:
-            fwd_dict: 前向传播结果字典
-            
-        返回:
-            KL散度
-        """
-        # 获取编码器输出
-        z = fwd_dict['delta']
-        mu = fwd_dict['mu_q_delta']
-        logsigma = fwd_dict['logsigma_q_delta']
-        
-        # 计算log q(z|x)，这是编码器输出的后验分布的对数概率
-        log_qz = -0.5 * (1 + 2 * logsigma - mu.pow(2) - torch.exp(2 * logsigma)).sum(-1)
-        
-        # 计算log p(z)，这是先验分布的对数概率
-        log_pz = self._log_p_z_mixture(z)
-        
-        # 计算KL散度 = log q(z|x) - log p(z)
-        kl = log_qz - log_pz
-        
-        return kl
 
-    def _log_p_z_mixture(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        计算混合先验的对数概率
-        参考自vae/model/boost.py中的log_p_z方法
-        
-        参数:
-            z: 隐变量
-            
-        返回:
-            对数概率
-        """
-        # 如果没有组件，使用标准正态分布作为后备
-        if len(self.prior.mu_list) == 0:
-            return log_Normal_standard(z, dim=1)
-        
-        # 获取所有伪输入
-        pseudo_mus = []
-        pseudo_logvars = []
-        
-        # 如果已有编码好的伪输入分布，直接使用
-        if len(self.pr_q_means) > 0:
-            for mu, logvar in zip(self.pr_q_means, self.pr_q_logvars):
-                pseudo_mus.append(mu)
-                pseudo_logvars.append(logvar)
-        else:
-            # 否则，对每个伪输入重新计算潜变量分布
-            for i, pseudo_input in enumerate(self.prior.mu_list):
-                pseudo_input = pseudo_input.to(self.device)
-                with torch.no_grad():
-                    mu, logvar = self.encoder(pseudo_input)
-                pseudo_mus.append(mu)
-                pseudo_logvars.append(logvar)
-        
-        # 拼接所有均值和方差
-        pseudo_mus = torch.cat(pseudo_mus, dim=0)  # [n_components, n_topics]
-        pseudo_logvars = torch.cat(pseudo_logvars, dim=0)  # [n_components, n_topics]
-        
-        # 准备计算
-        z_expand = z.unsqueeze(1)  # [batch_size, 1, n_topics]
-        pseudo_mus = pseudo_mus.unsqueeze(0)  # [1, n_components, n_topics]
-        pseudo_logvars = pseudo_logvars.unsqueeze(0)  # [1, n_components, n_topics]
-        
-        # 计算z在每个组件下的对数概率
-        log_p_z_given_c = -0.5 * (
-            math.log(2 * math.pi) 
-            + pseudo_logvars
-            + (z_expand - pseudo_mus).pow(2) / torch.exp(pseudo_logvars)
-        ).sum(dim=2)  # [batch_size, n_components]
-        
-        # 获取组件权重
-        weights = self.prior.weights.to(self.device) / self.prior.num_tasks
-        log_weights = torch.log(weights).unsqueeze(0)  # [1, n_components]
-        
-        # 计算混合分布的对数概率
-        log_p_z = torch.logsumexp(log_p_z_given_c + log_weights, dim=1)  # [batch_size]
-        
-        return log_p_z
+
 
     def add_component(self, new_pseudo_input: Optional[torch.Tensor] = None, alpha: Optional[float] = None) -> None:
         """
@@ -398,7 +321,7 @@ class CL_scETM(nn.Module):
             new_pseudo_input: 新伪输入，如不提供则使用默认值
             alpha: 新组件的权重，如不提供则使用默认值
         """
-        if self.prior_type != 'mixture':
+        if self.prior_type != 'vamp':
             raise ValueError("只有使用混合先验时才能添加组件")
         
         # 如果未提供伪输入，则使用默认初始化
@@ -421,7 +344,7 @@ class CL_scETM(nn.Module):
         更新混合先验中组件的权重
         参考自vae/model/boost.py中的update_component_weigts方法
         """
-        if self.prior_type != 'mixture':
+        if self.prior_type != 'vamp':
             raise ValueError("只有使用混合先验时才能更新组件权重")
         
         print('正在修剪组件...')
@@ -462,7 +385,7 @@ class CL_scETM(nn.Module):
         完成当前任务的训练，准备下一个任务
         参考自vae/model/boost.py中的finish_training_task方法
         """
-        if self.prior_type != 'mixture':
+        if self.prior_type != 'vamp':
             return
         
         initial_train_mode = self.training
@@ -623,12 +546,12 @@ class CL_scETM(nn.Module):
             'enable_global_bias': self.enable_global_bias,
             'n_batches': self.n_batches,
             # 对于混合先验，保存额外信息
-            'prior_num_tasks': self.prior.num_tasks if self.prior_type == 'mixture' else 1,
-            'prior_weights': self.prior.weights.cpu() if self.prior_type == 'mixture' else None,
-            'prior_task_weight': self.prior.task_weight.cpu() if self.prior_type == 'mixture' else None,
-            'prior_mu_list': [mu.cpu() for mu in self.prior.mu_list] if self.prior_type == 'mixture' else None,
-            'pr_q_means': [mu.data.cpu() for mu in self.pr_q_means] if self.prior_type == 'mixture' and self.pr_q_means else None,
-            'pr_q_logvars': [logvar.data.cpu() for logvar in self.pr_q_logvars] if self.prior_type == 'mixture' and self.pr_q_logvars else None,
+            'prior_num_tasks': self.prior.num_tasks if self.prior_type == 'vamp' else 1,
+            'prior_weights': self.prior.weights.cpu() if self.prior_type == 'vamp' else None,
+            'prior_task_weight': self.prior.task_weight.cpu() if self.prior_type == 'vamp' else None,
+            'prior_mu_list': [mu.cpu() for mu in self.prior.mu_list] if self.prior_type == 'vamp' else None,
+            'pr_q_means': [mu.data.cpu() for mu in self.pr_q_means] if self.prior_type == 'vamp' and self.pr_q_means else None,
+            'pr_q_logvars': [logvar.data.cpu() for logvar in self.pr_q_logvars] if self.prior_type == 'vamp' and self.pr_q_logvars else None,
         }, save_path)
         
         print(f"模型已保存到 {save_path}")
@@ -670,7 +593,7 @@ class CL_scETM(nn.Module):
         model.load_state_dict(checkpoint['model_state_dict'])
         
         # 对于混合先验，恢复先验状态
-        if checkpoint['prior_type'] == 'mixture':
+        if checkpoint['prior_type'] == 'vamp':
             model.prior.num_tasks = checkpoint['prior_num_tasks']
             model.prior.weights = checkpoint['prior_weights'].to(device)
             model.prior.task_weight = checkpoint['prior_task_weight'].to(device)
@@ -695,7 +618,7 @@ class CL_scETM(nn.Module):
         """
         self.eval()
         
-        if self.prior_type == 'mixture' and len(self.pr_q_means) > 0:
+        if self.prior_type == 'vamp' and len(self.pr_q_means) > 0:
             # 从混合先验中采样
             n_comp = len(self.pr_q_means)
             weights = (self.prior.weights[:n_comp] / self.prior.task_weight[:n_comp]).cpu().numpy()

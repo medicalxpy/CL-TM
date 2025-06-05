@@ -214,29 +214,6 @@ def calculate_kl(
     # 计算KL散度：log q(z|x) - log p(z)
     kl_value = logqz - logpz
     
-    # 如果需要重要性采样，则采集更多样本并平均
-    if importance_samples > 1:
-        all_kls = [kl_value]
-        for _ in range(importance_samples - 1):
-            # 重新采样z
-            z_sample = reparameterize(q_mu, q_logvar)
-            
-            # 为新样本计算logpz（根据先验类型可能需要重新计算）
-            # 注意：这里假设logpz函数会被外部重新调用，所以我们不在这里实现
-            
-            # 计算新样本的logqz
-            new_logqz = gaussian_log_density(z_sample, q_mu, q_logvar, dim=1)
-            
-            # 计算KL
-            # 注意：这里需要外部函数重新计算新样本的logpz
-            # all_kls.append(new_logqz - new_logpz)
-            
-            # 由于重要性采样需要重新计算logpz，这里暂不实现
-            pass
-        
-        # 由于重要性采样需要重新计算logpz，这里暂不实现
-        # kl_value = torch.stack(all_kls).mean(0)
-        raise NotImplementedError("重要性采样目前尚未实现，请设置importance_samples=1")
     
     # 如果需要对batch维度求平均
     if reduce:
@@ -250,7 +227,7 @@ def get_kl_divergence(
     q_logvar: torch.Tensor, 
     prior_type: str = 'standard',
     prior_params: Dict[str, Any] = None,
-    reduce: bool = True
+    reduce: bool = False
 ) -> torch.Tensor:
     """
     统一接口计算KL散度，根据先验类型选择适当的logpz计算函数。
@@ -286,7 +263,14 @@ def get_kl_divergence(
     else:
         raise ValueError(f"不支持的先验类型: {prior_type}")
     
-    # 计算KL散度
-    return calculate_kl(z, q_mu, q_logvar, logpz, 
-                        importance_samples=prior_params.get('importance_samples', 1),
-                        reduce=reduce)
+    logqz = gaussian_log_density(z, q_mu, q_logvar, dim=1)
+    
+    # 计算KL散度：log q(z|x) - log p(z)
+    kl_value = logqz - logpz
+    
+    
+    # 如果需要对batch维度求平均
+    if reduce:
+        return kl_value.mean()
+    else:
+        return kl_value

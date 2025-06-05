@@ -21,7 +21,7 @@ def log_Normal_standard(z: torch.Tensor, dim: Optional[int] = None):
     else:
         return log_normal
 
-def get_kl(mu: torch.Tensor, logsigma: torch.Tensor):
+def KL_scETM(mu: torch.Tensor, logsigma: torch.Tensor):
     """计算KL散度：KL(q(z|x) || p(z))，其中p(z)是标准正态分布N(0, I)，q(z|x)是N(mu, sigma)。
     
     参考自 scETM/models/model_utils.py 中的 get_kl 函数。
