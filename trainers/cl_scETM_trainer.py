@@ -9,7 +9,7 @@ import torch
 from torch import optim
 from torch.utils.tensorboard import SummaryWriter
 import anndata
-
+import pickle
 # 导入自定义模块
 from models.cl_scetm import CL_scETM
 from data.scETMdataset import create_data_loader
@@ -498,27 +498,292 @@ class CL_scETM_Trainer:
         # 开始新任务的训练
         return self.train(n_epochs=n_epochs, **train_kwargs)
 
-    def load_checkpoint(self, epoch: int) -> None:
-        """加载检查点。
+
+def train_with_adaptive_boosting(self,
+                                n_epochs: int = 100,
+                                weight_threshold: float = 0.05,
+                                max_components_per_task: int = 10,
+                                **train_kwargs) -> Dict[str, List[float]]:
+    """
+    使用自适应boosting的训练
+    
+    参数:
+        n_epochs: 基础VAE训练轮数
+        weight_threshold: 组件权重阈值
+        max_components_per_task: 每个task最大组件数
+    """
+    
+    # 先进行常规的VAE训练
+    print("开始基础VAE训练...")
+    history = self.train(n_epochs=n_epochs, **train_kwargs)
+    
+    # 如果使用混合先验，进行boosting训练
+    if self.model.prior_type == 'vamp':
+        print("\n开始自适应boosting训练...")
         
-        参数:
-            epoch: 要加载的epoch
-        """
-        if self.ckpt_dir is None:
-            raise ValueError("未设置检查点目录")
-            
-        additional_info = load_checkpoint(
-            self.model, self.optimizer, epoch, self.ckpt_dir
+        # 获取当前task的优化数据
+        X_opt = self._get_optimization_data()
+        
+        # 执行boosting训练
+        n_components = self._continual_boosting_training(
+            X_opt,
+            weight_threshold=weight_threshold,
+            max_components_per_task=max_components_per_task
         )
         
-        # 恢复训练状态
-        if 'current_task' in additional_info:
-            self.current_task = additional_info['current_task']
-        if 'trained_genes' in additional_info:
-            self.trained_genes = additional_info['trained_genes']
-        if 'epoch' in additional_info:
-            self.epoch = additional_info['epoch']
-        if 'step' in additional_info:
-            self.step = additional_info['step']
+        print(f"Boosting训练完成，共添加 {n_components} 个组件")
+        
+        # 完成当前task
+        self.model.finish_training_task()
+    
+    return history
+
+def _continual_boosting_training(self,
+                               X_opt: torch.Tensor,
+                               weight_threshold: float = 0.05,
+                               max_components_per_task: int = 10) -> int:
+    """
+    执行持续学习的boosting训练
+    
+    参数:
+        X_opt: 优化数据
+        weight_threshold: 权重阈值
+        max_components_per_task: 最大组件数
+        
+    返回:
+        添加的组件数量
+    """
+    
+    # 阶段1：更新现有组件权重
+    if len(self.model.prior.mu_list) > 1:
+        self.model.update_existing_component_weights(X_opt, n_steps=100)
+    
+    # 阶段2：循环添加新组件
+    n_components_added = 0
+    
+    while n_components_added < max_components_per_task:
+        print(f"\n--- 训练第 {n_components_added + 1} 个新组件 ---")
+        
+        # 使用BooVAE方法训练新组件
+        new_weight = self.model.train_new_component_boovae_style(
+            X_opt,
+            max_steps=30000,
+            lbd=1.0
+        )
+        
+        print(f"新组件训练完成，权重: {new_weight:.6f}")
+        
+        # 检查权重阈值
+        if new_weight < weight_threshold:
+            print(f"权重 {new_weight:.6f} < 阈值 {weight_threshold}，停止添加组件")
+            break
+        
+        # 接受新组件
+        self.model.accept_new_component_with_weight(new_weight)
+        n_components_added += 1
+        
+        print(f"✓ 组件已接受，当前共 {n_components_added} 个组件")
+    
+    return n_components_added
+
+def _get_optimization_data(self, n_samples: int = 1000) -> torch.Tensor:
+    """获取用于优化的数据样本"""
+    
+    # 从训练数据中随机采样
+    if hasattr(self, 'train_adata') and self.train_adata is not None:
+        n_cells = min(n_samples, self.train_adata.n_obs)
+        indices = np.random.choice(self.train_adata.n_obs, n_cells, replace=False)
+        
+        X = self.train_adata.X[indices]
+        if hasattr(X, 'todense'):
+            X = X.todense()
+        
+        X_opt = torch.FloatTensor(X).to(self.device)
+        return X_opt
+    else:
+        # 如果没有训练数据，返回随机数据
+        return torch.randn(n_samples, self.model.n_genes, device=self.device)
+
+# 修改continue_training方法
+def continue_training(self,
+                     new_adata: anndata.AnnData,
+                     n_epochs: int = 100,
+                     weight_threshold: float = 0.05,
+                     max_components_per_task: int = 10,
+                     **train_kwargs) -> Dict[str, List[float]]:
+    """
+    持续学习训练
+    """
+    
+    _logger.info(f"开始持续学习，当前任务: {self.current_task + 1}")
+        
+        # 准备新数据
+
+    self.model, new_adata = prepare_for_continual_learning(
+        self.model, 
+        new_adata,
+        prev_genes=self.trained_genes,
+        keep_new_unique_genes=True
+    )
             
-        _logger.info(f"从epoch {epoch} 恢复训练状态")
+        # 更新数据集
+    self.adata = new_adata
+    test_ratio = train_kwargs.pop('test_ratio', 0.1)
+    if test_ratio > 0:
+        self.train_adata, self.test_adata = train_test_split(
+            new_adata, test_ratio
+        )
+    else:
+        self.train_adata = self.test_adata = new_adata
+            
+        # 如果使用混合先验，完成上一个任务
+        if self.model.prior_type == 'vamp' and self.current_task > 0:
+            self.model.finish_training_task()
+            
+        # 更新任务计数
+        self.current_task += 1
+        
+        # 更新已训练基因列表
+        self.trained_genes = list(set(self.trained_genes) | set(new_adata.var_names))
+        
+    return self.train_with_adaptive_boosting(
+        n_epochs=n_epochs,
+        weight_threshold=weight_threshold,
+        max_components_per_task=max_components_per_task,
+        **train_kwargs
+    )
+# 在 trainers/cl_scETM_trainer.py 中添加
+
+def train_with_adaptive_boosting(self,
+                                n_epochs: int = 100,
+                                weight_threshold: float = 0.05,
+                                max_components_per_task: int = 10,
+                                save_dir: str = None,
+                                save_checkpoints: bool = True,
+                                **train_kwargs) -> Dict[str, List[float]]:
+    """带保存功能的自适应boosting训练"""
+    
+    # 设置保存目录
+    if save_dir is None:
+        save_dir = f"./checkpoints/task_{getattr(self.model, 'current_task', 0)}"
+    
+    # 保存训练前状态
+    if save_checkpoints:
+        pre_training_path = self.model.save_model_state(
+            save_dir, 
+            task_id=getattr(self.model, 'current_task', 0)
+        )
+        print(f"训练前状态已保存: {pre_training_path}")
+    
+    # 基础VAE训练
+    print("开始基础VAE训练...")
+    history = self.train(n_epochs=n_epochs, **train_kwargs)
+    
+    # 保存VAE训练后状态
+    if save_checkpoints:
+        post_vae_path = self.model.save_checkpoint_during_training(
+            save_dir, 
+            getattr(self.model, 'current_task', 0)
+        )
+    
+    # Boosting训练
+    if self.model.prior_type == 'vamp':
+        print("\n开始自适应boosting训练...")
+        
+        X_opt = self._get_optimization_data()
+        
+        # 带保存的boosting训练
+        n_components = self._continual_boosting_training_with_saves(
+            X_opt,
+            weight_threshold=weight_threshold,
+            max_components_per_task=max_components_per_task,
+            save_dir=save_dir if save_checkpoints else None
+        )
+        
+        # 完成task
+        self.model.finish_training_task()
+        
+        # 保存最终状态
+        if save_checkpoints:
+            final_path = self.model.save_model_state(
+                save_dir, 
+                task_id=getattr(self.model, 'current_task', 0)
+            )
+            print(f"最终状态已保存: {final_path}")
+            
+            # 导出组件分析
+            analysis_dir = os.path.join(save_dir, "analysis")
+            self.model.export_components_for_analysis(analysis_dir)
+    
+    return history
+
+def _continual_boosting_training_with_saves(self,
+                                          X_opt: torch.Tensor,
+                                          weight_threshold: float = 0.05,
+                                          max_components_per_task: int = 10,
+                                          save_dir: str = None) -> int:
+    """带保存功能的boosting训练"""
+    
+    # 权重更新
+    if len(self.model.prior.mu_list) > 1:
+        self.model.update_existing_component_weights(X_opt, n_steps=100)
+        
+        # 保存权重更新后状态
+        if save_dir:
+            self.model.save_checkpoint_during_training(
+                save_dir,
+                getattr(self.model, 'current_task', 0)
+            )
+    
+    # 组件训练循环
+    n_components_added = 0
+    
+    while n_components_added < max_components_per_task:
+        print(f"\n--- 训练第 {n_components_added + 1} 个新组件 ---")
+        
+        # 训练新组件
+        new_weight = self.model.train_new_component_boovae_style(
+            X_opt,
+            max_steps=30000,
+            lbd=1.0
+        )
+        
+        print(f"新组件训练完成，权重: {new_weight:.6f}")
+        
+        # 检查权重阈值
+        if new_weight < weight_threshold:
+            print(f"权重 {new_weight:.6f} < 阈值 {weight_threshold}，停止添加组件")
+            break
+        
+        # 接受新组件
+        self.model.accept_new_component_with_weight(new_weight)
+        n_components_added += 1
+        
+        # 保存每个组件训练后的状态
+        if save_dir:
+            component_path = self.model.save_checkpoint_during_training(
+                save_dir,
+                getattr(self.model, 'current_task', 0),
+                component_id=n_components_added
+            )
+            print(f"组件 {n_components_added} 状态已保存")
+        
+        print(f"✓ 组件已接受，当前共 {n_components_added} 个组件")
+    
+    return n_components_added
+
+def save_training_history(self, 
+                         history: Dict[str, List[float]], 
+                         save_path: str):
+    """保存训练历史"""
+    
+    with open(save_path, 'wb') as f:
+        pickle.dump(history, f)
+    
+    print(f"训练历史已保存: {save_path}")
+
+def load_model_from_checkpoint(self, checkpoint_path: str):
+    """从checkpoint加载模型"""
+    
+    self.model = CL_scETM.load_from_checkpoint(checkpoint_path, self.device)
+    print(f"模型已从checkpoint加载: {checkpoint_path}")
