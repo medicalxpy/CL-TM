@@ -169,8 +169,6 @@ class VampMixture(nn.Module):
     def __init__(self, pseudoinputs, alpha=[1.]):
         super(VampMixture, self).__init__()
         self.num_comp = len(pseudoinputs)  # id of the component in the current task
-        self.num_tasks = 1  # id of the current task
-        # self.base_distr = MultivariateNormalLRD
 
         # [(1, inp_size), ...]
         self.mu_list = pseudoinputs
