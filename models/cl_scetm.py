@@ -12,6 +12,7 @@ from models.scETM_core.decoder import DecoderETM
 
 # 导入先验
 from priors.mixture_prior import VampMixture
+from priors.gaussian_prior import IncrementalGaussianPrior, StandardGaussianPrior
 
 # 导入损失计算函数
 from loss.RL import get_reconstruction_loss
@@ -72,6 +73,8 @@ class CL_scETM(nn.Module):
         pseudoinputs_mean: float = 0.0,
         pseudoinputs_std: float = 0.1,
         X_opt: Optional[torch.Tensor] = None,
+        prior_strength: float = 1.0,
+        adaptive_strength: bool = True,
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     ) -> None:
         super(CL_scETM, self).__init__()
@@ -129,6 +132,16 @@ class CL_scETM(nn.Module):
             # 存储编码后的伪输入分布
             self.pr_q_means = []
             self.pr_q_logvars = []
+        elif prior_type == 'incremental':
+            # 初始化增量高斯先验
+            self.prior = IncrementalGaussianPrior(
+                z_dim=n_topics,
+                device=device,
+                prior_strength=prior_strength,
+                adaptive_strength=adaptive_strength
+            )
+        else:  # standard prior
+            self.prior = StandardGaussianPrior(z_dim=n_topics)
         
         # 将模型移动到指定设备
         self.to(device)
@@ -230,19 +243,31 @@ class CL_scETM(nn.Module):
         
         # 重构损失（负对数似然）
         nll = -torch.sum(x * fwd_dict['recon_log'], dim=1)
-        prior_params=None
-        if self.prior_type=='vamp':
-            prior_params={
-                'encoder':self.encoder,
+        
+        # KL散度计算
+        if self.prior_type == 'vamp':
+            prior_params = {
+                'encoder': self.encoder,
                 'pseudoinputs': pseudoinputs,
                 'weights': weights
             }
-        # KL散度
-        kl=get_kl_divergence(z=fwd_dict['delta'],
-                             q_mu=fwd_dict['mu_q_delta'],
-                             q_logvar=fwd_dict['logsigma_q_delta'],
-                             prior_type=self.prior_type,
-                            prior_params=prior_params)
+            kl = get_kl_divergence(z=fwd_dict['delta'],
+                                 q_mu=fwd_dict['mu_q_delta'],
+                                 q_logvar=fwd_dict['logsigma_q_delta'],
+                                 prior_type=self.prior_type,
+                                 prior_params=prior_params)
+        elif self.prior_type == 'incremental':
+            # 使用增量高斯先验计算KL散度
+            kl = self.prior.get_kl_divergence(
+                z_mu=fwd_dict['mu_q_delta'],
+                z_logvar=fwd_dict['logsigma_q_delta']
+            )
+        else:  # standard prior
+            # 使用标准高斯先验计算KL散度
+            kl = self.prior.get_kl_divergence(
+                z_mu=fwd_dict['mu_q_delta'],
+                z_logvar=fwd_dict['logsigma_q_delta']
+            )
         
         # 计算总损失
         loss = nll + beta * kl
@@ -255,3 +280,102 @@ class CL_scETM(nn.Module):
         
         # 返回总损失和各部分
         return loss, {'nll': nll, 'kl': kl}
+
+    def train_step(self, 
+                   optimizer: torch.optim.Optimizer,
+                   data_dict: Dict[str, torch.Tensor],
+                   hyper_param_dict: Dict[str, Any] = None) -> Dict[str, float]:
+        """
+        执行一个训练步骤
+        
+        参数:
+            optimizer: 优化器
+            data_dict: 数据字典，包含'X'和'batch_indices'
+            hyper_param_dict: 超参数字典，包含'kl_weight'等
+            
+        返回:
+            训练记录字典
+        """
+        if hyper_param_dict is None:
+            hyper_param_dict = {}
+        
+        # 获取数据
+        x = data_dict['X']
+        batch_indices = data_dict.get('batch_indices', None)
+        kl_weight = hyper_param_dict.get('kl_weight', 1.0)
+        
+        # 前向传播和损失计算
+        loss, loss_dict = self.calculate_loss(
+            x=x,
+            batch_indices=batch_indices,
+            beta=kl_weight,
+            pseudoinputs=hyper_param_dict.get('pseudoinputs', None),
+            weights=hyper_param_dict.get('weights', None),
+            average=True
+        )
+        
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # 返回训练记录
+        return {
+            'loss': float(loss.item()),
+            'nll': float(loss_dict['nll'].item()),
+            'kl': float(loss_dict['kl'].item()),
+            'kl_weight': kl_weight
+        }
+
+    def finalize_dataset_training(self):
+        """
+        完成当前数据集的训练，更新增量先验
+        """
+        if self.prior_type == 'incremental' and isinstance(self.prior, IncrementalGaussianPrior):
+            self.prior.finalize_current_dataset()
+            self.prior.update_prior_from_current()
+            print("增量先验已更新")
+
+    def get_prior_info(self) -> Dict:
+        """
+        获取先验信息
+        """
+        if hasattr(self.prior, 'get_prior_info'):
+            return self.prior.get_prior_info()
+        else:
+            return {'type': self.prior_type}
+
+    def save_incremental_state(self) -> Dict:
+        """
+        保存增量训练状态
+        """
+        state = {
+            'model_state_dict': self.state_dict(),
+            'prior_type': self.prior_type,
+            'model_config': {
+                'n_genes': self.n_genes,
+                'n_topics': self.n_topics,
+                'gene_emb_dim': self.gene_emb_dim,
+                'normalize_beta': self.normalize_beta,
+                'n_batches': self.n_batches,
+            }
+        }
+        
+        # 保存先验状态
+        if self.prior_type == 'incremental' and isinstance(self.prior, IncrementalGaussianPrior):
+            state['prior_state'] = self.prior.save_state()
+        
+        return state
+
+    def load_incremental_state(self, state_dict: Dict):
+        """
+        加载增量训练状态
+        """
+        # 加载模型参数
+        self.load_state_dict(state_dict['model_state_dict'])
+        
+        # 加载先验状态
+        if 'prior_state' in state_dict and self.prior_type == 'incremental':
+            if isinstance(self.prior, IncrementalGaussianPrior):
+                self.prior.load_state(state_dict['prior_state'])
+                print("增量先验状态已加载")
