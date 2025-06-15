@@ -442,6 +442,240 @@ class IncrementalTrainer:
         
         return {'theta': theta, 'delta': delta}
     
+    def get_topic_gene_matrix(self) -> np.ndarray:
+        """
+        获取主题-基因权重矩阵（beta矩阵）
+        
+        返回:
+            beta: 主题-基因权重矩阵 [n_topics, n_genes]
+        """
+        if self.model is None:
+            raise ValueError("模型尚未初始化")
+        
+        self.model.eval()
+        
+        with torch.no_grad():
+            # 从解码器获取beta矩阵
+            beta = self.model.decoder.get_beta()
+            return beta.cpu().numpy()
+    
+    def get_all_topic_matrices(self, adata: anndata.AnnData,
+                              batch_size: int = 1024,
+                              batch_col: str = 'batch_indices') -> Dict[str, np.ndarray]:
+        """
+        获取所有主题相关矩阵
+        
+        参数:
+            adata: 数据集
+            batch_size: 批大小
+            batch_col: 批次列名
+            
+        返回:
+            包含所有矩阵的字典:
+            - 'cell_topic_matrix' (theta): [n_cells, n_topics] 细胞-主题矩阵
+            - 'topic_gene_matrix' (beta): [n_topics, n_genes] 主题-基因矩阵
+            - 'cell_embedding' (delta): [n_cells, n_topics] 细胞嵌入
+        """
+        if self.model is None:
+            raise ValueError("模型尚未初始化")
+        
+        _logger.info("提取所有主题矩阵...")
+        
+        # 获取细胞-主题矩阵
+        topic_representations = self.get_topic_representations(adata, batch_size, batch_col)
+        
+        # 获取主题-基因矩阵
+        beta_matrix = self.get_topic_gene_matrix()
+        
+        matrices = {
+            'cell_topic_matrix': topic_representations['theta'],  # [n_cells, n_topics]
+            'topic_gene_matrix': beta_matrix,                     # [n_topics, n_genes]
+            'cell_embedding': topic_representations['delta']      # [n_cells, n_topics]
+        }
+        
+        _logger.info(f"矩阵提取完成:")
+        _logger.info(f"  - 细胞-主题矩阵: {matrices['cell_topic_matrix'].shape}")
+        _logger.info(f"  - 主题-基因矩阵: {matrices['topic_gene_matrix'].shape}")
+        _logger.info(f"  - 细胞嵌入矩阵: {matrices['cell_embedding'].shape}")
+        
+        return matrices
+    
+    def save_topic_matrices(self, 
+                           adata: anndata.AnnData,
+                           save_dir: str,
+                           batch_size: int = 1024,
+                           batch_col: str = 'batch_indices',
+                           save_format: str = 'npz'):
+        """
+        提取并保存所有主题矩阵
+        
+        参数:
+            adata: 数据集
+            save_dir: 保存目录
+            batch_size: 批大小
+            batch_col: 批次列名
+            save_format: 保存格式 ('npz', 'npy', 'csv', 'h5')
+        """
+        import os
+        
+        if self.model is None:
+            raise ValueError("模型尚未初始化")
+        
+        # 创建保存目录
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 获取所有矩阵
+        matrices = self.get_all_topic_matrices(adata, batch_size, batch_col)
+        
+        _logger.info(f"保存主题矩阵到: {save_dir}")
+        
+        if save_format == 'npz':
+            # 保存为npz格式（推荐）
+            save_path = os.path.join(save_dir, 'topic_matrices.npz')
+            np.savez_compressed(
+                save_path,
+                cell_topic_matrix=matrices['cell_topic_matrix'],
+                topic_gene_matrix=matrices['topic_gene_matrix'],
+                cell_embedding=matrices['cell_embedding']
+            )
+            _logger.info(f"矩阵已保存为NPZ格式: {save_path}")
+            
+        elif save_format == 'npy':
+            # 分别保存为npy格式
+            for name, matrix in matrices.items():
+                save_path = os.path.join(save_dir, f'{name}.npy')
+                np.save(save_path, matrix)
+                _logger.info(f"{name} 已保存: {save_path}")
+                
+        elif save_format == 'csv':
+            # 保存为CSV格式（适合小矩阵）
+            for name, matrix in matrices.items():
+                save_path = os.path.join(save_dir, f'{name}.csv')
+                np.savetxt(save_path, matrix, delimiter=',')
+                _logger.info(f"{name} 已保存: {save_path}")
+                
+        elif save_format == 'h5':
+            # 保存为HDF5格式
+            try:
+                import h5py
+                save_path = os.path.join(save_dir, 'topic_matrices.h5')
+                with h5py.File(save_path, 'w') as f:
+                    for name, matrix in matrices.items():
+                        f.create_dataset(name, data=matrix, compression='gzip')
+                _logger.info(f"矩阵已保存为H5格式: {save_path}")
+            except ImportError:
+                _logger.error("h5py未安装，无法保存H5格式")
+                raise
+        else:
+            raise ValueError(f"不支持的保存格式: {save_format}")
+        
+        # 保存矩阵信息
+        info_path = os.path.join(save_dir, 'matrix_info.json')
+        matrix_info = {
+            'n_cells': int(matrices['cell_topic_matrix'].shape[0]),
+            'n_topics': int(matrices['cell_topic_matrix'].shape[1]),
+            'n_genes': int(matrices['topic_gene_matrix'].shape[1]),
+            'dataset_count': self.dataset_count,
+            'model_config': {
+                'n_topics': self.n_topics,
+                'hidden_sizes': self.hidden_sizes,
+                'gene_emb_dim': self.gene_emb_dim,
+                'prior_strength': self.prior_strength,
+                'adaptive_strength': self.adaptive_strength
+            },
+            'matrix_shapes': {
+                name: list(matrix.shape) for name, matrix in matrices.items()
+            }
+        }
+        
+        import json
+        with open(info_path, 'w') as f:
+            json.dump(matrix_info, f, indent=2)
+        _logger.info(f"矩阵信息已保存: {info_path}")
+    
+    def analyze_topic_matrices(self, 
+                              adata: anndata.AnnData,
+                              batch_size: int = 1024,
+                              batch_col: str = 'batch_indices',
+                              top_genes_per_topic: int = 10) -> Dict:
+        """
+        分析主题矩阵并提供统计信息
+        
+        参数:
+            adata: 数据集
+            batch_size: 批大小
+            batch_col: 批次列名
+            top_genes_per_topic: 每个主题显示的顶级基因数量
+            
+        返回:
+            分析结果字典
+        """
+        if self.model is None:
+            raise ValueError("模型尚未初始化")
+        
+        _logger.info("分析主题矩阵...")
+        
+        # 获取所有矩阵
+        matrices = self.get_all_topic_matrices(adata, batch_size, batch_col)
+        
+        cell_topic = matrices['cell_topic_matrix']  # [n_cells, n_topics]
+        topic_gene = matrices['topic_gene_matrix']  # [n_topics, n_genes]
+        
+        analysis = {
+            'matrix_shapes': {
+                'cell_topic_matrix': cell_topic.shape,
+                'topic_gene_matrix': topic_gene.shape
+            },
+            'topic_statistics': {},
+            'cell_statistics': {},
+            'top_genes_per_topic': {}
+        }
+        
+        # 主题统计
+        topic_usage = cell_topic.mean(axis=0)  # 每个主题的平均使用率
+        topic_entropy = -np.sum(cell_topic * np.log(cell_topic + 1e-10), axis=0)  # 主题熵
+        
+        analysis['topic_statistics'] = {
+            'topic_usage_mean': float(topic_usage.mean()),
+            'topic_usage_std': float(topic_usage.std()),
+            'topic_usage_per_topic': topic_usage.tolist(),
+            'topic_entropy_mean': float(topic_entropy.mean()),
+            'topic_entropy_std': float(topic_entropy.std()),
+            'topic_entropy_per_topic': topic_entropy.tolist()
+        }
+        
+        # 细胞统计
+        cell_entropy = -np.sum(cell_topic * np.log(cell_topic + 1e-10), axis=1)  # 细胞主题分布熵
+        dominant_topic = np.argmax(cell_topic, axis=1)  # 每个细胞的主导主题
+        
+        analysis['cell_statistics'] = {
+            'cell_entropy_mean': float(cell_entropy.mean()),
+            'cell_entropy_std': float(cell_entropy.std()),
+            'dominant_topic_distribution': np.bincount(dominant_topic, minlength=self.n_topics).tolist()
+        }
+        
+        # 每个主题的顶级基因
+        if hasattr(adata, 'var_names'):
+            gene_names = adata.var_names.tolist()
+        else:
+            gene_names = [f'Gene_{i}' for i in range(topic_gene.shape[1])]
+        
+        for topic_idx in range(self.n_topics):
+            topic_weights = topic_gene[topic_idx, :]
+            top_gene_indices = np.argsort(topic_weights)[-top_genes_per_topic:][::-1]
+            
+            analysis['top_genes_per_topic'][f'topic_{topic_idx}'] = {
+                'gene_names': [gene_names[i] for i in top_gene_indices],
+                'weights': topic_weights[top_gene_indices].tolist(),
+                'indices': top_gene_indices.tolist()
+            }
+        
+        _logger.info(f"主题矩阵分析完成")
+        _logger.info(f"  - 主题平均使用率: {analysis['topic_statistics']['topic_usage_mean']:.4f}")
+        _logger.info(f"  - 细胞平均熵: {analysis['cell_statistics']['cell_entropy_mean']:.4f}")
+        
+        return analysis
+    
     def save_model(self, save_path: str):
         """
         保存模型和训练历史

@@ -146,7 +146,49 @@ def main():
         logger.info(f"总样本数: {summary['total_samples']}")
         logger.info(f"平均每个数据集训练时间: {summary['average_time_per_dataset']:.2f}秒")
         
-        # 7. 获取先验信息
+        # 7. 提取并保存主题矩阵
+        logger.info("=" * 50)
+        logger.info("提取主题矩阵")
+        logger.info("=" * 50)
+        
+        # 在第二个数据集上提取矩阵（作为最终结果）
+        try:
+            # 保存主题矩阵
+            trainer.save_topic_matrices(
+                adata=second_adata,
+                save_dir="./results/topic_matrices",
+                batch_size=CONFIG['batch_size'],
+                save_format='npz'  # 可选: 'npz', 'npy', 'csv', 'h5'
+            )
+            
+            # 分析主题矩阵
+            analysis_results = trainer.analyze_topic_matrices(
+                adata=second_adata,
+                batch_size=CONFIG['batch_size'],
+                top_genes_per_topic=20
+            )
+            
+            # 保存分析结果
+            import json
+            os.makedirs("./results", exist_ok=True)
+            with open("./results/topic_analysis.json", 'w') as f:
+                json.dump(analysis_results, f, indent=2)
+            
+            logger.info("主题矩阵和分析结果已保存到 ./results/ 目录")
+            
+            # 显示一些关键统计信息
+            logger.info(f"矩阵形状:")
+            for name, shape in analysis_results['matrix_shapes'].items():
+                logger.info(f"  - {name}: {shape}")
+            
+            logger.info(f"主题统计:")
+            logger.info(f"  - 平均主题使用率: {analysis_results['topic_statistics']['topic_usage_mean']:.4f}")
+            logger.info(f"  - 平均细胞熵: {analysis_results['cell_statistics']['cell_entropy_mean']:.4f}")
+            
+        except Exception as e:
+            logger.warning(f"主题矩阵提取失败: {str(e)}")
+        
+        # 8. 获取先验信息
         prior_info = trainer.model.get_prior_info()
         logger.info("=" * 50)
         logger.info("最终先验分布信息")
@@ -154,7 +196,11 @@ def main():
         for key, value in prior_info.items():
             logger.info(f"{key}: {value}")
         
-        logger.info("训练完成！模型已保存到 ./models/ 目录")
+        logger.info("="*50)
+        logger.info("训练完成！")
+        logger.info("模型已保存到 ./models/ 目录")
+        logger.info("主题矩阵已保存到 ./results/ 目录")
+        logger.info("="*50)
         
     except Exception as e:
         logger.error(f"训练过程中出现错误: {str(e)}")
